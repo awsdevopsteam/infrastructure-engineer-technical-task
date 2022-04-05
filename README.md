@@ -23,45 +23,220 @@ If you have any questions about this process, please speak to your recruitment c
 ## Tasks
 
 ### 1. Docker
-A basic TypeScript application has been created in the `application` folder. Create a Dockerfile to build this application, making sure that it runs on your local device.
 
-### 2. CI/CD
- - :arrow_forward: CircleCI
- - :arrow_forward: Bitbucket Pipelines
- - :arrow_forward: Github Actions
+```Dockerfile
+FROM node:16
+WORKDIR /app
+COPY package.json ./
+COPY tsconfig.json ./
+COPY src ./src
+RUN ls -a
+RUN npm install
+EXPOSE 3000
+CMD ["npm","run","start:dev"]
 
-Write a YAML-based CI/CD pipeline to build, push and deploy this docker image to an imaginary Amazon Kubernetes Service cluster.
+```
 
-Kubernetes resource definitions have been included in the `kubernetes` folder.
 
-Use whatever mechanism/tools you think are appropriate/relevant to "deploy" the application.
+### 2. CI/CD- used groovy jenkins
 
-NOTE: This pipeline does not have to be active. All we're looking for is the YAML file. Minor syntax errors will be overlooked.
+ ```Jenkinsfile
+pipeline {
+    agent { label "master" }
+    environment {
+        ECR_REGISTRY = "444444000111.dkr.ecr.eu-west-2.amazonaws.com/express:latest"
+        APP_REPO_NAME= "Reponame"
+    }
+    stages {
+        stage('Build Docker Image') {
+            steps {
+                sh 'docker build --force-rm -t "$ECR_REGISTRY/$APP_REPO_NAME:latest" .'
+                sh 'docker image ls'
+            }
+        }
+        stage('Push Image to ECR Repo') {
+            steps {
+                sh 'aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin "$ECR_REGISTRY"'
+                sh 'docker push "$ECR_REGISTRY/$APP_REPO_NAME:latest"'
+            }
+        }
+    }
+       stage('Deploy') {
+            steps {
+                sh 'kubectl apply -f deployment.yaml,service.yaml'
+            }
+        }
+    }
 
-### 3. Infrastructure as Code
- - :arrow_forward: AWS CDK in TypeScript
- - :arrow_forward: Terraform
+    post {
+        always {
+            echo 'Deleting all local images'
+            sh 'docker image prune -af'
+        }
+    }
+}
+```
+ 
+ 
+### 3. Infrastructure as Code- Used Cloudformation 
 
-Create some Infrastructure as Code resources to deploy an EC2 instance and an RDS database to an imaginary AWS account.
+```yaml
+AWSTemplateFormatVersion: 2010-09-09
+Description: |
+  CloudFormation Template for deploying an EC2 instance with Elastic Load Balancer and ASG using RDS database to an imaginary AWS account.
+Parameters:
+  MyVPC:
+    Description: VPC Id of your existing account
+    Type: AWS::EC2::VPC::Id
 
-The EC2 instance must be able to connect to RDS, and the EC2 instance will need to be accessed as follows:
- - SSH from IPs `107.22.40.20` and `18.215.226.36`
- - HTTPS traffic from anywhere
+  KeyName:
+    Description: write your Key Pair
+    Type: AWS::EC2::KeyPair::KeyName
 
-Consider other general security best practices.
+  MySubnets:
+    Description: Please select your subnets
+    Type: List<AWS::EC2::Subnet::Id>
 
-Assume the default VPC exists and can be used for this infrastructure.
+Resources:
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable HTTP (80) for Application Load Balancer
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
 
-Other configuration can be decided by yourself, based on the instance being used for a low resource usage, low traffic web application.
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable HTTP for Flask Web Server and SSH for getting into EC2
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+       - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 107.22.40.20 
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 18.215.226.36
+
+  WebServerLT:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: ami-0c2b8ca1dad447f8a
+        InstanceType: t2.micro
+        KeyName: !Ref KeyName
+        SecurityGroupIds:
+          - !GetAtt WebServerSecurityGroup.GroupId
+        TagSpecifications:
+          - ResourceType: instance
+            Tags: 
+              - Key: Name
+                Value: !Sub Web Server of ${AWS::StackName} Stack
+        
+  WebServerTG:
+    Type: "AWS::ElasticLoadBalancingV2::TargetGroup"
+    Properties:
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      UnhealthyThresholdCount: 3
+      HealthyThresholdCount: 2
+      VpcId: !Ref MyVPC
+  
+  ApplicationLoadBalancer:
+    Type: "AWS::ElasticLoadBalancingV2::LoadBalancer"
+    Properties:
+      IpAddressType: ipv4
+      Scheme: internet-facing
+      SecurityGroups:
+        - !GetAtt ALBSecurityGroup.GroupId
+      Subnets: !Ref MySubnets
+      Type: application
+
+  ALBListener:
+    Type: "AWS::ElasticLoadBalancingV2::Listener"
+    Properties:
+      DefaultActions: 
+        - TargetGroupArn: !Ref WebServerTG
+          Type: forward
+      LoadBalancerArn: !Ref ApplicationLoadBalancer 
+      Port: 80 
+      Protocol: HTTP 
+
+  WebServerASG:
+    Type: "AWS::AutoScaling::AutoScalingGroup"
+    Properties:
+      AvailabilityZones:
+        !GetAZs ""
+      DesiredCapacity: 2
+      HealthCheckGracePeriod: 90
+      HealthCheckType: ELB
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebServerLT
+        Version: !GetAtt WebServerLT.LatestVersionNumber
+      MaxSize: 3
+      MinSize: 1 
+      TargetGroupARNs:
+        - !Ref WebServerTG
+
+  MyDBSecurityGroup:
+    Type: AWS::RDS::DBSecurityGroup
+    Properties:
+      GroupDescription: This is for Frontend access to RDS instance
+      DBSecurityGroupIngress:
+        - CIDRIP: 0.0.0.0/0
+        - EC2SecurityGroupId: !GetAtt WebServerSecurityGroup.GroupId 
+
+  MyDatabaseServer:
+    Type: AWS::RDS::DBInstance
+    Properties: 
+      AllocatedStorage: 20
+      AllowMajorVersionUpgrade: false
+      AutoMinorVersionUpgrade: true
+      BackupRetentionPeriod: 0
+      DBInstanceClass: db.t2.micro
+      DBInstanceIdentifier: technical task
+      DBName: task-1
+      DBSecurityGroups: 
+        - !Ref MyDBSecurityGroup
+      DeletionProtection: true
+      Engine: mysql
+      EngineVersion: 8.0.19
+      MasterUsername: admin
+      MasterUserPassword: osman2745
+      Port: 3306
+      PubliclyAccessible: true
+
+Outputs:
+  WebsiteURL:
+    Value: !Sub 
+      - http://${ALBAddress}
+      - ALBAddress: !GetAtt ApplicationLoadBalancer.DNSName
+    Description: TASK Application Load Balancer URL
+
+```
+
+
 
 ## Questions
 
  1. How long did you spend on this assessment in total?\
- _
+   2 hours
 
  2. What was the most difficult task?\
- _
+ 
+ First one 
 
  3. If you had an unlimited amount of time to complete this task, what would you have done differently?\
- _
+ I may use terraform
 
